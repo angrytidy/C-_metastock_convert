@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace MetaStockConverter
@@ -27,6 +28,7 @@ namespace MetaStockConverter
 		public event Action<string>? LogMessage;
 
 		private readonly IProgress<string>? _logger;
+		private StreamWriter? _logFileWriter;
 
 		public MetaStockFileConverter() { }
 
@@ -54,114 +56,105 @@ namespace MetaStockConverter
 
 		public void ConvertFolder(string inputFolder, string outputFolder, ConversionOptions options, CancellationToken cancellationToken)
 		{
-			Log($"Input: {inputFolder}");
-			Log($"Output: {outputFolder}");
-
-			var master = FindMasterFile(inputFolder);
-			if (master == null)
+			try
 			{
-				throw new FileNotFoundException("MASTER/EMASTER/XMASTER not found in input folder.");
+				// Initialize log file
+				InitializeLogFile(outputFolder);
+				
+				Log($"Input: {inputFolder}");
+				Log($"Output: {outputFolder}");
+
+				var master = FindMasterFile(inputFolder);
+				if (master == null)
+				{
+					throw new FileNotFoundException("MASTER/EMASTER/XMASTER not found in input folder.");
+				}
+
+				Log($"Detected master file: {Path.GetFileName(master)}");
+
+				Directory.CreateDirectory(outputFolder);
+
+				foreach (var entry in ReadMaster(master))
+				{
+					cancellationToken.ThrowIfCancellationRequested();
+					if (string.IsNullOrWhiteSpace(entry.Symbol)) continue;
+
+					try
+					{
+						var dataFile = entry.IsMWD ? Path.Combine(inputFolder, $"F{entry.FileNumber}.MWD") : Path.Combine(inputFolder, $"F{entry.FileNumber}.DAT");
+						if (!File.Exists(dataFile))
+						{
+							Log($"Data file missing for {entry.Symbol}: {dataFile}");
+							continue;
+						}
+
+						ProcessDataFile(dataFile, entry.Symbol, outputFolder);
+					}
+					catch (Exception ex)
+					{
+						Log($"Error processing {entry.Symbol}: {ex.Message}");
+					}
+				}
 			}
-
-			Log($"Detected master file: {Path.GetFileName(master)}");
-
-			foreach (var entry in ReadMaster(master))
+			finally
 			{
-				cancellationToken.ThrowIfCancellationRequested();
-				if (string.IsNullOrWhiteSpace(entry.Symbol)) continue;
-
-				try
-				{
-					ProcessSymbol(entry, inputFolder, outputFolder, options, cancellationToken);
-				}
-				catch (Exception ex)
-				{
-					Log($"Error processing {entry.Symbol}: {ex.Message}");
-				}
+				// Always close the log file
+				CloseLogFile();
 			}
 		}
 
-		private void ProcessSymbol(MasterEntry entry, string inputFolder, string outputFolder, ConversionOptions options, CancellationToken token)
+		private bool ProcessDataFile(string datFilename, string symbol, string outputFolder)
 		{
-			var dataFile = entry.IsMWD ? Path.Combine(inputFolder, $"F{entry.FileNumber}.MWD") : Path.Combine(inputFolder, $"F{entry.FileNumber}.DAT");
-			if (!File.Exists(dataFile))
+			try
 			{
-				Log($"Data file missing for {entry.Symbol}: {dataFile}");
-				return;
-			}
+				string safeSymbol = SanitizeFileName(symbol);
+				string csvFilename = Path.Combine(outputFolder, $"{safeSymbol}.csv");
 
-			var outFile = Path.Combine(outputFolder, $"{entry.Symbol}.csv");
-			var anomaliesFile = Path.Combine(outputFolder, $"{entry.Symbol}_anomalies.csv");
+				using var fs = new FileStream(datFilename, FileMode.Open, FileAccess.Read);
+				using var br = new BinaryReader(fs);
+				using var writer = new StreamWriter(csvFilename, false, Encoding.UTF8);
 
-			Directory.CreateDirectory(outputFolder);
-
-			using var reader = new BinaryReader(File.OpenRead(dataFile));
-			using var writer = new StreamWriter(File.Open(outFile, FileMode.Create, FileAccess.Write, FileShare.Read), new UTF8Encoding(false));
-			using var anomalies = new StreamWriter(File.Open(anomaliesFile, FileMode.Create, FileAccess.Write, FileShare.Read), new UTF8Encoding(false));
-
-			var hasOpenInterest = options.IncludeOpenInterest;
-			if (hasOpenInterest)
-			{
-				writer.WriteLine("Date,Open,High,Low,Close,Volume,OpenInterest");
-				anomalies.WriteLine("Date,Open,High,Low,Close,Volume,OpenInterest,Reason");
-			}
-			else
-			{
 				writer.WriteLine("Date,Open,High,Low,Close,Volume");
-				anomalies.WriteLine("Date,Open,High,Low,Close,Volume,Reason");
-			}
 
-			int recordIndex = 0;
-			var validRows = new List<(DateOnly date, float open, float high, float low, float close, float volume, float? oi, long offset)>();
-			while (reader.BaseStream.Position < reader.BaseStream.Length)
+				int recordCount = 0;
+				int rowIndex = 0;
+
+				while (fs.Position <= fs.Length - 24)
+				{
+					byte[] buffer = br.ReadBytes(24);
+					if (buffer.Length != 24) break;
+
+					// Auto-detect for date; others can use MSBIN (will still be sane) or switch to IEEE if needed
+					float dateF  = ReadMetaStockFloat(buffer,  0, isDateField: true);
+					float open   = ReadMetaStockFloat(buffer,  4, isDateField: false);
+					float high   = ReadMetaStockFloat(buffer,  8, isDateField: false);
+					float low    = ReadMetaStockFloat(buffer, 12, isDateField: false);
+					float close  = ReadMetaStockFloat(buffer, 16, isDateField: false);
+					float volume = ReadMetaStockFloat(buffer, 20, isDateField: false);
+
+					int dateInt = (int)dateF;
+					if (!IsPlausibleDateInt(dateInt))
+					{
+						// anomaly – skip or collect based on your options
+						if (DetailedLog) Log($"Data anomaly in {Path.GetFileNameWithoutExtension(datFilename)} row {rowIndex}: date={dateInt}");
+						rowIndex++;
+						continue;
+					}
+
+					string dateStr = FormatDate(dateInt);
+					writer.WriteLine($"{dateStr},{open:F4},{high:F4},{low:F4},{close:F4},{volume:F2}");
+					recordCount++;
+					rowIndex++;
+				}
+
+				Log($"📈 {safeSymbol}: {recordCount} records → {safeSymbol}.csv");
+				return recordCount > 0;
+			}
+			catch (Exception ex)
 			{
-				token.ThrowIfCancellationRequested();
-				long offset = reader.BaseStream.Position;
-				float dateRaw = ReadMsBinFloat(reader);
-				float open = ReadMsBinFloat(reader);
-				float high = ReadMsBinFloat(reader);
-				float low = ReadMsBinFloat(reader);
-				float close = ReadMsBinFloat(reader);
-				float volume = ReadMsBinFloat(reader);
-				float? oi = null;
-				if (hasOpenInterest && reader.BaseStream.Position + 4 <= reader.BaseStream.Length)
-				{
-					oi = ReadMsBinFloat(reader);
-				}
-
-				var (isValid, date, reason) = ValidateRecord(dateRaw, open, high, low, close, volume);
-				if (!isValid)
-				{
-					WriteAnomaly(anomalies, hasOpenInterest, date, open, high, low, close, volume, oi, reason);
-					recordIndex++;
-					continue;
-				}
-
-				validRows.Add((date!.Value, open, high, low, close, volume, oi, offset));
-				recordIndex++;
+				Log($"❌ Error processing {symbol}: {ex.Message}");
+				return false;
 			}
-
-			// Interpolation / carry-forward handling
-			IEnumerable<(DateOnly date, float open, float high, float low, float close, float volume, float? oi)> outputRows = validRows
-				.Select(v => (v.date, v.open, v.high, v.low, v.close, v.volume, v.oi));
-			if (options.Interpolate && validRows.Count >= 2)
-			{
-				outputRows = InterpolateSeries(validRows);
-			}
-
-			foreach (var r in outputRows)
-			{
-				if (hasOpenInterest)
-				{
-					writer.WriteLine($"{r.date:yyyy-MM-dd},{r.open},{r.high},{r.low},{r.close},{r.volume},{r.oi.GetValueOrDefault()}");
-				}
-				else
-				{
-					writer.WriteLine($"{r.date:yyyy-MM-dd},{r.open},{r.high},{r.low},{r.close},{r.volume}");
-				}
-			}
-
-			Log($"Processed {entry.Symbol} with {validRows.Count} valid rows.");
 		}
 
 		private static void WriteAnomaly(StreamWriter anomalies, bool hasOpenInterest, DateOnly? date, float open, float high, float low, float close, float volume, float? oi, string reason)
@@ -271,10 +264,15 @@ namespace MetaStockConverter
 			{
 				var buffer = br.ReadBytes(53);
 				if (buffer.Length < 53) yield break;
-				int fileNo = buffer[0];
-				string symbol = Encoding.ASCII.GetString(buffer, 1, 14).Trim();
-				if (!string.IsNullOrWhiteSpace(symbol))
-					yield return new MasterEntry(fileNo, symbol, false);
+				int fileNumber = buffer[0];
+				var (symbol, name) = ExtractMasterSymbolName(buffer);
+				if (string.IsNullOrWhiteSpace(symbol)) continue;
+
+				// optional: quick debug for first few items
+				if (fileNumber <= 5)
+					Log($"MASTER map: F{fileNumber} → Symbol='{symbol}', Name='{name}'");
+
+				yield return new MasterEntry(fileNumber, symbol, false);
 				index++;
 			}
 		}
@@ -310,11 +308,182 @@ namespace MetaStockConverter
 			return (float)value;
 		}
 
+		// Accepts typical ticker chars
+		private static readonly Regex SymbolRegex =
+			new(@"^[A-Za-z0-9\.\-\$]{1,15}$", RegexOptions.Compiled);
+
+		// file-name safe ticker
+		private static string SanitizeFileName(string s)
+		{
+			if (string.IsNullOrWhiteSpace(s)) return "UNKNOWN";
+			var invalid = Path.GetInvalidFileNameChars();
+			var cleaned = new string(s.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
+			cleaned = cleaned.Trim().TrimEnd('.');  // Windows cannot end with '.'
+			return string.IsNullOrEmpty(cleaned) ? "UNKNOWN" : cleaned;
+		}
+
+		// MASTER symbol/name extractor with fallback for swapped fields
+		private (string symbol, string name) ExtractMasterSymbolName(byte[] buffer)
+		{
+			const int MASTER_SYMBOL = 36; // 14 bytes
+			const int MASTER_NAME   = 7;  // 16 bytes
+
+			var s1 = ReadString(buffer, MASTER_SYMBOL, 14).Trim();
+			var n1 = ReadString(buffer, MASTER_NAME,   16).Trim();
+
+			if (SymbolRegex.IsMatch(s1))
+				return (s1, n1);
+
+			// try swapped interpretation (some datasets differ)
+			var s2 = ReadString(buffer, MASTER_NAME,   14).Trim();
+			var n2 = ReadString(buffer, MASTER_SYMBOL, 16).Trim();
+			if (SymbolRegex.IsMatch(s2))
+				return (s2, n2);
+
+			// last resort: sanitize whatever is most likely a usable key
+			var fallback = !string.IsNullOrEmpty(s1) ? s1 : n1;
+			return (SanitizeFileName(fallback), n1.Length > 0 ? n1 : n2);
+		}
+
+		private static string ReadString(byte[] buffer, int offset, int length)
+		{
+			if (offset + length > buffer.Length) return "";
+			return Encoding.ASCII.GetString(buffer, offset, length);
+		}
+
+		private static bool IsPlausibleDateInt(int v)
+		{
+			// YYYYMMDD
+			if (v >= 19000101 && v <= 20991231) return true;
+			// YYMMDD
+			if (v >= 500101 && v <= 991231) return true;
+			if (v >= 000101 && v <= 491231) return true; // assume 2000-2049 for 00-49
+			return false;
+		}
+
+		private static float ReadMsbin(byte[] buf, int off)
+		{
+			if (off + 4 > buf.Length) return 0f;
+			byte[] msbin = new byte[4];
+			Array.Copy(buf, off, msbin, 0, 4);
+			if (msbin[3] == 0) return 0f;
+
+			byte[] ieee = new byte[4];
+			byte sign = (byte)(msbin[2] & 0x80);
+			byte ieeeExp = (byte)(msbin[3] - 2);
+			ieee[3] = (byte)((sign) | (ieeeExp >> 1));
+			ieee[2] = (byte)(((ieeeExp << 7) & 0x80) | (msbin[2] & 0x7F));
+			ieee[1] = msbin[1];
+			ieee[0] = msbin[0];
+			return BitConverter.ToSingle(ieee, 0);
+		}
+
+		// Auto-detect: for the *date* field, try MSBIN first, then IEEE if implausible.
+		private static float ReadMetaStockFloat(byte[] buf, int off, bool isDateField)
+		{
+			float vMsbin = ReadMsbin(buf, off);
+			if (!isDateField)
+			{
+				if (float.IsFinite(vMsbin)) return vMsbin;
+				return BitConverter.ToSingle(buf, off);
+			}
+
+			int d = (int)vMsbin;
+			if (IsPlausibleDateInt(d)) return vMsbin;
+
+			float vIeee = BitConverter.ToSingle(buf, off);
+			int d2 = (int)vIeee;
+			if (IsPlausibleDateInt(d2)) return vIeee;
+
+			// Fallback to MSBIN if neither looks plausible — caller may skip
+			return vMsbin;
+		}
+
+		private static string FormatDate(int dateInt)
+		{
+			try
+			{
+				int year, month, day;
+				if (dateInt > 1000000 && dateInt < 100000000) // YYYYMMDD
+				{
+					year = dateInt / 10000;
+					month = (dateInt / 100) % 100;
+					day = dateInt % 100;
+				}
+				else
+				{
+					int yy = dateInt / 10000;
+					month = (dateInt / 100) % 100;
+					day = dateInt % 100;
+					year = yy >= 70 ? 1900 + yy : 2000 + yy;
+				}
+				return $"{year:D4}-{month:D2}-{day:D2}";
+			}
+			catch
+			{
+				return "0000-00-00";
+			}
+		}
+
+		private void InitializeLogFile(string outputFolder)
+		{
+			try
+			{
+				var logDirectory = Path.Combine(outputFolder, "log");
+				Directory.CreateDirectory(logDirectory);
+				
+				var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+				var logFilePath = Path.Combine(logDirectory, $"MetaStockConverter_{timestamp}.txt");
+				
+				_logFileWriter = new StreamWriter(logFilePath, false, Encoding.UTF8);
+				_logFileWriter.WriteLine($"MetaStock Converter Log - {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+				_logFileWriter.WriteLine(new string('=', 50));
+				_logFileWriter.Flush();
+			}
+			catch (Exception ex)
+			{
+				// If we can't create log file, continue without file logging
+				_logger?.Report($"Warning: Could not create log file: {ex.Message}");
+			}
+		}
+
+		private void CloseLogFile()
+		{
+			try
+			{
+				if (_logFileWriter != null)
+				{
+					_logFileWriter.WriteLine(new string('=', 50));
+					_logFileWriter.WriteLine($"Log completed at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+					_logFileWriter.Close();
+					_logFileWriter.Dispose();
+					_logFileWriter = null;
+				}
+			}
+			catch
+			{
+				// Ignore errors when closing log file
+			}
+		}
+
 		private void Log(string message)
 		{
-			_logger?.Report(message);
-			_progressCurrent?.Report(message);
-			LogMessage?.Invoke(message);
+			var timestampedMessage = $"{DateTime.Now:HH:mm:ss}: {message}";
+			
+			_logger?.Report(timestampedMessage);
+			_progressCurrent?.Report(timestampedMessage);
+			LogMessage?.Invoke(timestampedMessage);
+			
+			// Write to log file
+			try
+			{
+				_logFileWriter?.WriteLine(timestampedMessage);
+				_logFileWriter?.Flush();
+			}
+			catch
+			{
+				// If file logging fails, continue without it
+			}
 		}
 	}
 }
