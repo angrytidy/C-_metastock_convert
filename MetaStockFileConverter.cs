@@ -72,27 +72,81 @@ namespace MetaStockConverter
 
 				Log($"Detected master file: {Path.GetFileName(master)}");
 
+				// Build quick index of present data files (case-insensitive, .DAT/.MWD)
+				var presentData = Directory.EnumerateFiles(inputFolder, "F*.*", SearchOption.TopDirectoryOnly)
+					.Where(p => {
+						var name = Path.GetFileName(p);
+						if (!name.StartsWith("F", StringComparison.OrdinalIgnoreCase)) return false;
+						var ext = Path.GetExtension(name);
+						return ext.Equals(".dat", StringComparison.OrdinalIgnoreCase) ||
+							   ext.Equals(".mwd", StringComparison.OrdinalIgnoreCase);
+					})
+					.Select(p => (path: p,
+							  num: int.TryParse(Path.GetFileNameWithoutExtension(p).Substring(1), out var n) ? n : -1,
+							  isMWD: Path.GetExtension(p).Equals(".mwd", StringComparison.OrdinalIgnoreCase)))
+					.Where(x => x.num >= 0)
+					.ToDictionary(x => x.num, x => (x.path, x.isMWD), comparer: EqualityComparer<int>.Default);
+
+				// Optional: show a completeness snapshot
+				Log($"Pre-scan: MASTER listed symbols will be matched against {presentData.Count} F*.DAT/MWD files found in the folder.");
+
+				// Add pre-run message when MASTER exists but only 1–2 data files are present
+				if (presentData.Count <= 2)
+					Log("ℹ Only a couple of F*.DAT/MWD files are present. That's why you'll see very few CSV outputs.");
+
 				Directory.CreateDirectory(outputFolder);
+
+				int totalSymbols = 0, filesFound = 0, rowsTotal = 0;
+				var missing = new List<string>();
 
 				foreach (var entry in ReadMaster(master))
 				{
 					cancellationToken.ThrowIfCancellationRequested();
 					if (string.IsNullOrWhiteSpace(entry.Symbol)) continue;
+					totalSymbols++;
 
-					try
+					// Prefer what's truly present in the folder (handles .DAT vs .MWD and casing)
+					if (presentData.TryGetValue(entry.FileNumber, out var present))
 					{
-						var dataFile = entry.IsMWD ? Path.Combine(inputFolder, $"F{entry.FileNumber}.MWD") : Path.Combine(inputFolder, $"F{entry.FileNumber}.DAT");
-						if (!File.Exists(dataFile))
-						{
-							Log($"Data file missing for {entry.Symbol}: {dataFile}");
-							continue;
-						}
-
-						ProcessDataFile(dataFile, entry.Symbol, outputFolder);
+						filesFound++;
+						int rc = ProcessDataFile(present.path, entry.Symbol, outputFolder);
+						if (rc > 0) rowsTotal += rc;
 					}
-					catch (Exception ex)
+					else
 					{
-						Log($"Error processing {entry.Symbol}: {ex.Message}");
+						missing.Add($"{entry.Symbol} (F{entry.FileNumber})");
+					}
+				}
+
+				// After loop:
+				if (missing.Count > 0)
+				{
+					Log($"⚠ Missing data files for {missing.Count} symbols (showing up to 20):");
+					foreach (var m in missing.Take(20)) Log($"   - {m}");
+					if (missing.Count > 20) Log($"   ... {missing.Count - 20} more");
+				}
+				Log($"Summary: symbols={totalSymbols}, filesFound={filesFound}, totalRows={rowsTotal}");
+
+				// Process orphan files not in MASTER
+				bool processOrphans = true; // TODO: wire to an Options checkbox in the UI
+				if (processOrphans)
+				{
+					// Build set of file numbers referenced by MASTER to avoid duplicates
+					var referenced = new HashSet<int>(ReadMaster(master).Select(e => e.FileNumber));
+					var orphans = presentData.Where(kv => !referenced.Contains(kv.Key)).ToList();
+
+					if (orphans.Count > 0)
+					{
+						Log($"ℹ Processing {orphans.Count} orphan data files not listed in {Path.GetFileName(master)}...");
+						foreach (var kv in orphans)
+						{
+							cancellationToken.ThrowIfCancellationRequested();
+							var fileNum = kv.Key;
+							var (path, isMWD) = kv.Value;
+							var symbol = $"F{fileNum}"; // Or derive symbol via a custom mapping if you have one
+							int rc = ProcessDataFile(path, symbol, outputFolder);
+							if (rc <= 0) Log($"ℹ {symbol}: no valid rows; CSV not created.");
+						}
 					}
 				}
 			}
@@ -103,57 +157,66 @@ namespace MetaStockConverter
 			}
 		}
 
-		private bool ProcessDataFile(string datFilename, string symbol, string outputFolder)
+		private int ProcessDataFile(string datFilename, string symbol, string outputFolder)
 		{
 			try
 			{
 				string safeSymbol = SanitizeFileName(symbol);
-				string csvFilename = Path.Combine(outputFolder, $"{safeSymbol}.csv");
-
 				using var fs = new FileStream(datFilename, FileMode.Open, FileAccess.Read);
 				using var br = new BinaryReader(fs);
-				using var writer = new StreamWriter(csvFilename, false, Encoding.UTF8);
 
-				writer.WriteLine("Date,Open,High,Low,Close,Volume");
+				var sb = new StringBuilder();
+				sb.AppendLine("Date,Open,High,Low,Close,Volume");
 
-				int recordCount = 0;
-				int rowIndex = 0;
+				int recordCount = 0, rowIndex = 0;
 
 				while (fs.Position <= fs.Length - 24)
 				{
 					byte[] buffer = br.ReadBytes(24);
 					if (buffer.Length != 24) break;
 
-					// Auto-detect for date; others can use MSBIN (will still be sane) or switch to IEEE if needed
-					float dateF  = ReadMetaStockFloat(buffer,  0, isDateField: true);
-					float open   = ReadMetaStockFloat(buffer,  4, isDateField: false);
-					float high   = ReadMetaStockFloat(buffer,  8, isDateField: false);
-					float low    = ReadMetaStockFloat(buffer, 12, isDateField: false);
-					float close  = ReadMetaStockFloat(buffer, 16, isDateField: false);
-					float volume = ReadMetaStockFloat(buffer, 20, isDateField: false);
+					float dateF  = ReadMetaStockFloat(buffer,  0, true);
+					float open   = ReadMetaStockFloat(buffer,  4, false);
+					float high   = ReadMetaStockFloat(buffer,  8, false);
+					float low    = ReadMetaStockFloat(buffer, 12, false);
+					float close  = ReadMetaStockFloat(buffer, 16, false);
+					float volume = ReadMetaStockFloat(buffer, 20, false);
 
 					int dateInt = (int)dateF;
 					if (!IsPlausibleDateInt(dateInt))
 					{
-						// anomaly – skip or collect based on your options
-						if (DetailedLog) Log($"Data anomaly in {Path.GetFileNameWithoutExtension(datFilename)} row {rowIndex}: date={dateInt}");
+						if (DetailedLog) Log($"Anomaly {safeSymbol} row {rowIndex}: invalid date={dateInt}");
 						rowIndex++;
 						continue;
 					}
 
 					string dateStr = FormatDate(dateInt);
-					writer.WriteLine($"{dateStr},{open:F4},{high:F4},{low:F4},{close:F4},{volume:F2}");
+					sb.AppendLine($"{dateStr},{open:F4},{high:F4},{low:F4},{close:F4},{volume:F2}");
+					if (recordCount == 0 && DetailedLog)
+						Log($"Preview {safeSymbol} first row: {dateStr},{open:F4},{high:F4},{low:F4},{close:F4},{volume:F2}");
+
 					recordCount++;
 					rowIndex++;
 				}
 
-				Log($"📈 {safeSymbol}: {recordCount} records → {safeSymbol}.csv");
-				return recordCount > 0;
+				if (recordCount > 0)
+				{
+					string csvFilename = Path.Combine(outputFolder, $"{safeSymbol}.csv");
+					using var writer = new StreamWriter(csvFilename, false, Encoding.UTF8);
+					writer.Write(sb.ToString());
+					Log($"📈 {safeSymbol}: {recordCount} records → {safeSymbol}.csv");
+				}
+				else
+				{
+					Log($"ℹ {safeSymbol}: no valid rows; CSV not created.");
+				}
+
+				return recordCount;
 			}
 			catch (Exception ex)
 			{
 				Log($"❌ Error processing {symbol}: {ex.Message}");
-				return false;
+				return -1;
 			}
 		}
 
@@ -236,44 +299,89 @@ namespace MetaStockConverter
 				.FirstOrDefault(File.Exists);
 		}
 
+		// Extension-insensitive auto-detect when not using presentData dictionary (fallback branch)
+		static string? ProbeDataFile(string folder, int n)
+		{
+			var cands = new[]
+			{
+				Path.Combine(folder, $"F{n}.DAT"),
+				Path.Combine(folder, $"F{n}.dat"),
+				Path.Combine(folder, $"F{n}.MWD"),
+				Path.Combine(folder, $"F{n}.mwd")
+			};
+			return cands.FirstOrDefault(File.Exists);
+		}
+
 		private readonly record struct MasterEntry(int FileNumber, string Symbol, bool IsMWD);
 
 		private IEnumerable<MasterEntry> ReadMaster(string masterPath)
 		{
 			var name = Path.GetFileName(masterPath).ToUpperInvariant();
-			if (name == "MASTER" || name == "EMASTER")
+			return name switch
 			{
-				foreach (var e in ReadMasterOrEMaster(masterPath)) yield return e;
-			}
-			else if (name == "XMASTER")
-			{
-				foreach (var e in ReadXMaster(masterPath)) yield return e;
-			}
-			else
-			{
-				throw new InvalidOperationException("Unknown master file type.");
-			}
+				"MASTER" => ReadMasterFile_Master(masterPath),
+				"EMASTER" => ReadEMaster(masterPath),
+				"XMASTER" => ReadXMaster(masterPath),
+				_ => throw new InvalidOperationException("Unknown master file type.")
+			};
 		}
 
-		private IEnumerable<MasterEntry> ReadMasterOrEMaster(string path)
+		// === MASTER / EMASTER / XMASTER readers ===
+		// MASTER: 53-byte header, then 53-byte records.
+		// EMASTER: 192-byte header, then 192-byte records (version 0x36 0x36 at record[0..1]).
+		// XMASTER: 150-byte header, then 150-byte records; file number is UInt16 at offset 65.
+
+		private IEnumerable<MasterEntry> ReadMasterFile_Master(string path)
 		{
 			using var fs = File.OpenRead(path);
 			using var br = new BinaryReader(fs);
-			int index = 0;
-			while (fs.Position < fs.Length)
+
+			// Skip MASTER header (53 bytes)
+			if (fs.Length < 53) yield break;
+			fs.Seek(53, SeekOrigin.Begin);
+
+			while (fs.Position <= fs.Length - 53)
 			{
 				var buffer = br.ReadBytes(53);
-				if (buffer.Length < 53) yield break;
-				int fileNumber = buffer[0];
-				var (symbol, name) = ExtractMasterSymbolName(buffer);
+				if (buffer.Length != 53) yield break;
+
+				int fileNumber = buffer[0]; // MASTER_FX = 0
+				var (symbol, name) = ExtractMasterSymbolName_Master(buffer); // MASTER offsets
 				if (string.IsNullOrWhiteSpace(symbol)) continue;
 
-				// optional: quick debug for first few items
+				// Debug first few
 				if (fileNumber <= 5)
 					Log($"MASTER map: F{fileNumber} → Symbol='{symbol}', Name='{name}'");
 
 				yield return new MasterEntry(fileNumber, symbol, false);
-				index++;
+			}
+		}
+
+		private IEnumerable<MasterEntry> ReadEMaster(string path)
+		{
+			using var fs = File.OpenRead(path);
+			using var br = new BinaryReader(fs);
+
+			// Skip EMASTER header (192 bytes)
+			if (fs.Length < 192) yield break;
+			fs.Seek(192, SeekOrigin.Begin);
+
+			while (fs.Position <= fs.Length - 192)
+			{
+				var buffer = br.ReadBytes(192);
+				if (buffer.Length != 192) yield break;
+
+				// Version bytes
+				if (!(buffer[0] == 0x36 && buffer[1] == 0x36)) continue;
+
+				int fileNumber = buffer[2]; // EMASTER_FX = 2
+				var (symbol, name) = ExtractMasterSymbolName_EMaster(buffer); // EMASTER offsets
+				if (string.IsNullOrWhiteSpace(symbol)) continue;
+
+				if (fileNumber <= 5)
+					Log($"EMASTER map: F{fileNumber} → Symbol='{symbol}', Name='{name}'");
+
+				yield return new MasterEntry(fileNumber, symbol, false);
 			}
 		}
 
@@ -281,14 +389,29 @@ namespace MetaStockConverter
 		{
 			using var fs = File.OpenRead(path);
 			using var br = new BinaryReader(fs);
-			while (fs.Position < fs.Length)
+
+			// Skip XMASTER header (150 bytes)
+			if (fs.Length < 150) yield break;
+			fs.Seek(150, SeekOrigin.Begin);
+
+			while (fs.Position <= fs.Length - 150)
 			{
 				var buffer = br.ReadBytes(150);
-				if (buffer.Length < 150) yield break;
-				int fileNo = buffer[0];
-				string symbol = Encoding.ASCII.GetString(buffer, 1, 16).Trim();
-				if (!string.IsNullOrWhiteSpace(symbol))
-					yield return new MasterEntry(fileNo, symbol, true);
+				if (buffer.Length != 150) yield break;
+
+				// Record type check: first byte 0x01 (commonly)
+				if (buffer[0] != 0x01) continue;
+
+				// Symbol at offset 1 (len 14), name at 16 (len 45), file number UInt16 at 65
+				string symbol = ReadString(buffer, 1, 14).Trim();
+				int fileNumber = BitConverter.ToUInt16(buffer, 65); // XMASTER_FN = 65
+
+				if (string.IsNullOrWhiteSpace(symbol)) continue;
+
+				if (fileNumber <= 5)
+					Log($"XMASTER map: F{fileNumber} → Symbol='{symbol}'");
+
+				yield return new MasterEntry(fileNumber, symbol, true);
 			}
 		}
 
@@ -322,27 +445,37 @@ namespace MetaStockConverter
 			return string.IsNullOrEmpty(cleaned) ? "UNKNOWN" : cleaned;
 		}
 
-		// MASTER symbol/name extractor with fallback for swapped fields
-		private (string symbol, string name) ExtractMasterSymbolName(byte[] buffer)
+		// MASTER field offsets
+		private (string symbol, string name) ExtractMasterSymbolName_Master(byte[] buffer)
 		{
-			const int MASTER_SYMBOL = 36; // 14 bytes
-			const int MASTER_NAME   = 7;  // 16 bytes
+			// MASTER_SYMBOL = 36 (14 bytes), MASTER_NAME = 7 (16 bytes)
+			string sym = ReadString(buffer, 36, 14).Trim();
+			string name = ReadString(buffer, 7, 16).Trim();
 
-			var s1 = ReadString(buffer, MASTER_SYMBOL, 14).Trim();
-			var n1 = ReadString(buffer, MASTER_NAME,   16).Trim();
+			// Heuristic: if sym isn't ticker-ish, try swap
+			if (!SymbolRegex.IsMatch(sym))
+			{
+				string s2 = ReadString(buffer, 7, 14).Trim();
+				string n2 = ReadString(buffer, 36, 16).Trim();
+				if (SymbolRegex.IsMatch(s2)) return (s2, n2);
+			}
+			return (sym, name);
+		}
 
-			if (SymbolRegex.IsMatch(s1))
-				return (s1, n1);
+		// EMASTER field offsets
+		private (string symbol, string name) ExtractMasterSymbolName_EMaster(byte[] buffer)
+		{
+			// EMASTER_SYMBOL = 11 (14 bytes), EMASTER_NAME = 32 (16 bytes)
+			string sym = ReadString(buffer, 11, 14).Trim();
+			string name = ReadString(buffer, 32, 16).Trim();
 
-			// try swapped interpretation (some datasets differ)
-			var s2 = ReadString(buffer, MASTER_NAME,   14).Trim();
-			var n2 = ReadString(buffer, MASTER_SYMBOL, 16).Trim();
-			if (SymbolRegex.IsMatch(s2))
-				return (s2, n2);
-
-			// last resort: sanitize whatever is most likely a usable key
-			var fallback = !string.IsNullOrEmpty(s1) ? s1 : n1;
-			return (SanitizeFileName(fallback), n1.Length > 0 ? n1 : n2);
+			if (!SymbolRegex.IsMatch(sym))
+			{
+				string s2 = ReadString(buffer, 32, 14).Trim();
+				string n2 = ReadString(buffer, 11, 16).Trim();
+				if (SymbolRegex.IsMatch(s2)) return (s2, n2);
+			}
+			return (sym, name);
 		}
 
 		private static string ReadString(byte[] buffer, int offset, int length)
